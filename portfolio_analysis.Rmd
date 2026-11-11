@@ -1,0 +1,556 @@
+---
+title: "Low-Risk Portfolio Optimisation in R"
+subtitle: "Risk-return analysis of 10 US stocks and a minimum-variance portfolio"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(quantmod)
+library(tidyverse)
+library(PerformanceAnalytics)
+```
+
+# 1. Data Preparation
+## 1. Loading Stock Price Data
+```{r Joint,  results='hide'}
+tickers <- c("AAPL", "AXP", "BBY", "CRM", "DUK","MA", "NEU", "NFLX", "NKE", "XOM")
+getSymbols(tickers, src = "yahoo",from = "2014-12-01",to = "2026-09-01")
+```
+
+## 2. Data Quality Checks
+All 10 tickers were checked to confirm that they were downloaded successfully, cover the same date range, and contain no missing (NA) values.
+```{r check-rows-dates}
+for (tk in tickers) {
+  cat(tk, ":", nrow(get(tk)), "rows —",
+      "from", as.character(index(get(tk))[1]),
+      "to", as.character(index(get(tk))[nrow(get(tk))]), "\n")
+}
+```
+
+```{r check-na}
+for (tk in tickers) {
+  n_na <- sum(is.na(Ad(get(tk))))
+  if (n_na > 0) cat(tk, "has", n_na, "NA values\n")
+}
+```
+All 10 tickers returned 2,954 daily observations covering 1 December 2014 to 31 August 2026, with zero missing values and no evidence of ticker changes or failed downloads
+
+## 3. Merging Adjusted Prices
+The 10 individual price series are merged into a single object, keeping only the Adjusted Close column for each stock.
+```{r merge-prices}
+prices <- do.call(merge, lapply(tickers, function(tk) Ad(get(tk))))
+colnames(prices) <- tickers
+head(prices)
+cat("NA values introduced by merging the 10 series:", sum(is.na(prices)), "\n")
+```
+
+## 4. Converting to Monthly Returns
+Daily prices are converted to monthly observations (last trading day of each month), and arithmetic monthly returns are calculated:
+
+$$r_{i,t} = \frac{P_{i,t} - P_{i,t-1}}{P_{i,t-1}}$$
+```{r month-return}
+# Convert daily prices to monthly (last trading day of each month)
+monthly_prices <- to.monthly(prices, indexAt = "lastof", OHLC = FALSE)
+
+# Calculate arithmetic monthly returns
+monthly_returns <- Return.calculate(monthly_prices, method = "discrete")
+
+# Remove the first row (NA, since Dec 2014 has no prior month to compare)
+monthly_returns <- monthly_returns[-1, ]
+
+head(monthly_returns)
+nrow(monthly_returns)
+```
+140 monthly return observations were obtained, covering Jan 2015 to Aug 2026, for all 10 stocks simultaneously.
+
+## 5. Loading and Converting the Risk-Free Rate
+The Federal Funds Rate (an annualised percentage rate, reported monthly) is retrieved from FRED and converted to a monthly decimal rate using compounding:
+
+$$r_{monthly} = \left(1 + \frac{FFR_{annual}}{100}\right)^{1/12} - 1$$
+
+```{r load-ffr}
+
+FEDFUNDS <- NULL
+# download the data from FRED, up to 3 times
+for (attempt in 1:3) {
+  FEDFUNDS <- tryCatch(
+    getSymbols("FEDFUNDS", src = "FRED", auto.assign = FALSE),
+    error = function(e) NULL)
+  if (!is.null(FEDFUNDS)) break
+  Sys.sleep(2)
+}
+
+# if all 3 tries failed, read the CSV file from the FRED website
+if (is.null(FEDFUNDS)) {
+  url <- "https://fred.stlouisfed.org/graph/fredgraph.csv?id=FEDFUNDS"
+  raw <- read.csv(url)
+  date_col <- intersect(c("observation_date", "DATE"), names(raw))[1]
+  FEDFUNDS <- xts(as.numeric(raw$FEDFUNDS),
+                  order.by = as.Date(raw[[date_col]]))
+}
+colnames(FEDFUNDS) <- "FEDFUNDS"
+
+# Keep only the months we need
+FEDFUNDS <- FEDFUNDS["2014-12/2026-09"]
+
+# check 
+head(FEDFUNDS)
+tail(FEDFUNDS)
+nrow(FEDFUNDS)
+cat("NA values in FEDFUNDS:", sum(is.na(FEDFUNDS)), "\n")
+```
+
+
+```{r convert-ffr}
+# Convert annual FFR (%) to monthly decimal rate
+ffr_monthly <- (1 + FEDFUNDS/100)^(1/12) - 1
+colnames(ffr_monthly) <- "RF"
+
+index(ffr_monthly) <- as.Date(as.yearmon(index(ffr_monthly)), frac = 1)
+
+ffr_monthly <- ffr_monthly["2015-01/2026-08"]
+
+head(ffr_monthly)
+nrow(ffr_monthly)
+```
+
+## 6. Combining Stock Returns and the Risk-Free Rate
+```{r merge-full-data}
+# Merge stock returns with risk-free rate
+full_data <- merge(monthly_returns, ffr_monthly)
+
+head(full_data)
+nrow(full_data)
+
+# Confirm the merge produced no unmatched or missing rows 
+cat("NA values in the combined dataset:", sum(is.na(full_data)), "\n")
+```
+The combined dataset contains 140 monthly observations across 11 columns (10 stock returns plus the risk-free rate), fully aligned by month
+
+## 7. Estimation and Validation Samples
+```{r split-samples}
+# Estimation sample: Jan 2015 - Dec 2024
+estimation_sample <- full_data["2015-01/2024-12"]
+
+# Validation sample: Jan 2025 - Aug 2026 (latest available data)
+validation_sample <- full_data["2025-01/2026-08"]
+
+nrow(estimation_sample)   # 10 years x 12 months = 120
+nrow(validation_sample)   # Jan 2025 - Aug 2026 = 20
+```
+The estimation sample contains 120 monthly observations (January 2015 to December 2024) and the validation sample contains 20 monthly observations (January 2025 - August 2026), matching the sample design specified in the brief
+
+## Summary of Data Preparation
+
+All 10 requested stocks (AAPL, AXP, BBY, CRM, DUK, MA, NEU, NFLX, NKE, XOM) were successfully obtained from Yahoo Finance. There were no failed downloads, and no ticker changes or missing data. Each stock returned 2,954 daily observations of adjusted close price, from 1 December 2014 to 31 August 2026. This was verified by a range check and an NA value check. Adjusted close is used over regular close, so no further adjustment for dividends or stock splits is required. The data are downloaded from Yahoo Finance and FRED each time the document is knitted, and Yahoo Finance can revise adjusted prices after the original download, so the results reported here reflect the download made on the date shown at the top of this document.
+
+Daily adjusted close prices are converted to a single month-end close price for each calendar month, always taking the last available trading day within that month, so short or holiday-affected months still produce one valid observation. Monthly arithmetic returns are then calculated from these month-end prices. The December 2014 return is dropped, since there is no prior month available to calculate a return for it — its price is used only as the base for calculating the January 2015 return, which is retained as the first valid observation in the dataset.
+
+The Federal Funds Rate (FEDFUNDS), the monthly average of the US overnight lending rate, is used as a proxy for the risk-free return in each month. It is retrieved directly from FRED each time the document is knitted, using the quantmod package (up to three attempts) and, if that fails, FRED's public CSV endpoint. FRED returns the full history from 1954, so the series is filtered to the project period before use. The annualised percentage rate is converted to a monthly decimal rate using the compounding formula $(1+r_{annual}/100)^{1/12}-1$, rather than simply dividing by 12, so that it reflects monthly compounding and is consistent with the monthly frequency of the stock returns. Its date index was set to the end of each month so that it can be joined with the stock returns, and it was trimmed to the same period (January 2015 to August 2026) before merging. The combined dataset contains 140 months across 11 columns: 10 stock return series plus the risk-free rate.
+
+Finally, the aligned dataset was divided into two fixed, non-overlapping windows. The estimation window (120 months, January 2015 to December 2024) was used to calculate expected returns and the covariance matrix, and to determine portfolio holdings for John, Mary and the household. The validation window (20 months, January 2025 to August 2026) was set aside for later out-of-sample analysis. September 2026 is excluded because the price data end on 1 September 2026 (the to date in getSymbols() is exclusive, so the last daily observation is 31 August 2026). No complete month of September trading is available, so August 2026 is the final completed monthly observation and the validation window ends there. Because the estimation and validation windows were fixed before any stock selection took place, leakage of validation-period information into the estimation stage was avoided by design.
+# 2. Stock Analysis and Low-Risk Portfolio
+## A1 - Return and Volatility Analysis 
+Units: returns are decimals (0.01 = 1%). Annual figures are simple scalings of
+monthly figures: mean x 12 and standard deviation x sqrt(12). The Sharpe ratio is
+
+$$\text{Sharpe}_i = \frac{\bar{r}_i - \bar{r}_f}{s_i}$$
+
+where $\bar{r}_f$ is the average monthly risk-free return, and $s_i$ is the standard
+deviation of the stock's excess return (return minus risk-free return). The annualised Sharpe ratio is the monthly one x sqrt(12).
+
+```{r A1_setup}
+stock_returns <- estimation_sample[, tickers]  
+rf <- estimation_sample[, "RF"]   
+```
+
+```{r A1_measures}
+avg_return <- colMeans(stock_returns)
+volatility <- apply(stock_returns, 2, sd)
+avg_rf     <- mean(rf)
+excess <- sweep(coredata(stock_returns), 1, as.numeric(rf))
+sharpe <- colMeans(excess) / apply(excess, 2, sd)
+
+a1_table <- data.frame(
+  Stock      = tickers,
+  Avg_Return = avg_return,
+  Volatility = volatility,
+  Sharpe     = sharpe,
+  row.names  = NULL
+)
+
+a1_show <- a1_table %>%
+  mutate(across(c(Avg_Return, Volatility), ~ round(.x * 100, 2)),
+         Sharpe = round(Sharpe, 3))
+
+knitr::kable(
+  a1_show,
+  col.names = c("Stock", "Mean return (% per month)","Volatility (% per month)", "Sharpe ratio (monthly)"),
+  caption = "Table A1a. Monthly return, volatility and Sharpe ratio (Jan 2015 - Dec 2024)"
+)
+
+```
+- AAPL has highest Sharpe ratio with 0.266 so it gave best return for risk taken
+- NFLX has the highest mean return like 3.21% per month but also the highest volatility 12.14% but it sharpe ratio 0.252 lower than AAPL
+- MA has almost the same Sharpe ratio as NFLX (0.251) but much lower volatility (6.54%)
+- DUK has lowest volatility but its return is low
+
+```{r a1_annual}
+a1_annual <- data.frame(
+  Stock = a1_table$Stock,
+  Annual_Return = a1_table$Avg_Return * 12 * 100,
+  Annual_Vol    = a1_table$Volatility * sqrt(12) * 100,
+  Annual_Sharpe = a1_table$Sharpe * sqrt(12)
+)
+knitr::kable(a1_annual, digits = c(0, 1, 1, 2), row.names = FALSE,
+  col.names = c("Stock", "Mean return (% per year)",
+                "Volatility (% per year)", "Sharpe ratio (annual)"),
+  caption = "Table A1b. Annualised return, volatility and Sharpe ratio")
+```
+- AAPL has the highest annual Sharpe ratio (0.92), followed by NFLX and MA (0.87)
+- NFLX has the highest return (38.5% per year) but also the highest volatility (42.1%)
+- No stock reaches a Sharpe ratio of 1, and NEU has the lowest (0.24)
+
+```{r check_outlier}
+# 1. Correlation with and without NFLX
+cor_all     <- cor(a1_table$Volatility, a1_table$Avg_Return)
+a1_no_nflx  <- a1_table[a1_table$Stock != "NFLX", ]
+cor_no_nflx <- cor(a1_no_nflx$Volatility, a1_no_nflx$Avg_Return)
+
+# 2. Spearman (uses ranks, so one extreme stock matters less)
+cor_spear <- cor(a1_table$Volatility, a1_table$Avg_Return, method = "spearman")
+
+# 3. Best and worst single month for NFLX (in %)
+nflx <- as.numeric(unlist(stock_returns[, "NFLX"]))
+nflx_range <- range(nflx) * 100
+
+outlier_check <- data.frame(
+  Check = c("Pearson, all 10 stocks", "Pearson, without NFLX",
+            "Spearman, all 10 stocks", "NFLX worst month (%)", "NFLX best month (%)"),
+  Value = c(cor_all, cor_no_nflx, cor_spear, nflx_range[1], nflx_range[2])
+)
+knitr::kable(outlier_check, digits = 3, row.names = FALSE,
+             caption = "Table A1c. Outlier checks")
+```
+- The Pearson correlation between mean return and volatility is 0.770, which is strong and positive, so stocks with higher volatility tended to have higher returns
+- The Spearman correlation, which uses ranks and is less affected by outliers, is 0.758, so the positive link does not depend only on NFLX
+which explains its high volatility.
+
+```{r A1 avg_risk-free_return}
+cat("Average monthly risk-free return (%):", round(avg_rf * 100, 4), "\n")
+```
+
+```{r plot_A1, fig.width=7, fig.height=5}
+# label positions: NKE and XOM sit close together, so place them left and right of their points
+a1_table$hj <- ifelse(a1_table$Stock == "NKE", 1.2, ifelse(a1_table$Stock == "XOM", -0.2, 0.5))
+a1_table$vj <- ifelse(a1_table$Stock %in% c("NKE", "XOM"), 0.5, -1)
+
+ggplot(a1_table, aes(x = Volatility, y = Avg_Return, label = Stock)) +
+  geom_hline(yintercept = avg_rf, linetype = "dashed") +
+  geom_point(aes(colour = Sharpe), size = 4) +
+  geom_text(aes(hjust = hj, vjust = vj)) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0.05, 0.12))) +
+  scale_colour_gradient(low = "red", high = "darkgreen") +
+  labs(title = "Figure A1. Risk and return of the 10 stocks",
+       x = "Volatility (% per month)",
+       y = "Mean return (% per month)",
+       colour = "Sharpe ratio",
+       caption = "Dashed line = average risk-free return")
+```
+
+- All stocks are above the dashed line, so all of them earned more than the risk-free return on average
+- Stocks with higher volatility had higher returns in general
+- NFLX is the highest return and the highest volatility
+- AAPL and MA have high returns for their level of risk, so they have the highest Sharpe ratios (dark green)
+- NEU, NKE and XOM have low returns and low Sharpe ratios(red)
+- BBY has high volatility but only a medium return, so its Sharpe ratio is low
+
+```{r A1-downside}
+max_dd <- as.numeric(maxDrawdown(stock_returns)) * 100
+worst  <- apply(coredata(stock_returns), 2, min) * 100
+
+a1_down <- data.frame(Stock = tickers,
+                      Worst_month = round(worst, 2),
+                      Max_drawdown = round(max_dd, 1),
+                      row.names = NULL)
+knitr::kable(a1_down,
+  col.names = c("Stock", "Worst month (%)", "Maximum drawdown (%)"),
+  caption = "Table A1d. Downside risk of each stock (Jan 2015 - Dec 2024)")
+```
+- NFLX has the largest losses: its worst month is −49.18% and its maximum drawdown is 74.7%, which means its price fell by almost three quarters from a previous peak
+- XOM, CRM and NKE also have large drawdowns (more than 54%)
+- DUK has the smallest losses on both measures (−12.99% and 18.8%)
+- MA and AAPL combine high Sharpe ratios with low drawdowns (26.2% and 30.5%)
+- CRM has a mild worst month (−17.26%) but a large drawdown (55.8%), so its price fell slowly over many months
+
+## A1 Discussion
+Table A1a and Figure A1 show the average monthly return, volatility and Sharpe ratio of the 10 stocks from January 2015 to December 2024 (Table A1b gives annualised figures). Average return measures the typical monthly gain; volatility (standard deviation) measures how widely monthly returns swing around that average; the Sharpe ratio is the excess return over the risk-free rate (0.15% per month) per unit of volatility. All 10 stocks beat the risk-free rate on average.
+
+AAPL (Sharpe 0.266), NFLX (0.252) and MA (0.251) are the most attractive, and MA matches NFLX's Sharpe ratio with about half the volatility (6.54% against 12.14%). NEU (0.070), NKE (0.081) and XOM (0.082) are the least attractive. The gaps between the top three are much smaller than the standard error of a Sharpe ratio (about 0.09 with n = 120), so they should be seen as similar rather than ranked, consistent with the overlapping intervals in A2 and the joint test in B2 (p = 0.475).
+
+Higher volatility tended to come with higher return (Pearson 0.77, or 0.52 without NFLX; Spearman 0.76, Table A1c), although theory rewards systematic rather than total risk.
+
+For John, DUK has the lowest volatility (4.90%) and the smallest drawdown (18.8%, Table A1d), and MA offers a good balance (Sharpe 0.251, drawdown 26.2%). Volatility treats gains and losses alike, while John cares mainly about losses, and the two can disagree: NEU has low volatility (5.66%) but a 38.2% drawdown, and NKE's drawdown (54.3%) is far worse than AAPL's (30.5%) despite similar volatility. Mary may prefer NFLX (highest return, 3.21% per month) or AAPL (2.26%, with a higher Sharpe ratio and lower volatility). NFLX is not automatically the best investment: its Sharpe ratio is below AAPL's, it lost 49.2% in April 2022, and its 74.7% drawdown would need a gain of about 295% to recover. These results are historical, based on only 10 stocks, and may not repeat.
+
+## A2 - Expected Returns, Interval Estimation and Normality
+For each stock the 95% confidence interval for the expected return is
+
+$$\bar{r}_i \pm t_{0.975,\,n-1} \times \frac{s_i}{\sqrt{n}}$$
+```{r A2-measures}
+n <- nrow(stock_returns)                
+variance <- apply(stock_returns, 2, var)       
+std_error <- volatility / sqrt(n)
+t_value <- qt(0.975, df = n - 1)
+lower <- avg_return - t_value * std_error
+upper <- avg_return + t_value * std_error
+
+a2_table <- data.frame(
+  Stock     = tickers,
+  Mean      = avg_return,
+  Variance  = variance,
+  SD        = volatility,
+  Lower     = lower,
+  Upper     = upper,
+  row.names = NULL
+)
+
+a2_show <- a2_table %>%
+  mutate(across(c(Mean, SD, Lower, Upper), ~ round(.x * 100, 3)),
+         Variance = round(Variance * 10000, 2)) 
+
+knitr::kable(
+  a2_show,
+  col.names = c("Stock", "Mean (% per month)", "Variance (%²)", "SD (% per month)",
+                "CI lower (%)", "CI upper (%)"),
+  caption = "Table A2a. 95% confidence intervals for expected monthly return (Jan 2015 - Dec 2024)"
+)
+
+cat("t critical value (df =", n - 1, "):", round(t_value, 4), "\n")
+
+```
+- AAPL, AXP, CRM, MA and NFLX have intervals that are fully above zero, so their expected returns are positive at the 95% level
+- BBY, DUK, NEU, NKE and XOM have intervals that include zero, so we cannot be sure that their expected returns are above zero
+- NFLX has the widest interval (1.014% to 5.404%) because it has the highest volatility, while DUK has the narrowest
+- Many intervals overlap, so the data do not show clearly which stock has the higher true expected return, and the mean returns are therefore estimated with a lot of uncertainty
+
+
+```{r normality_check}
+skew   <- function(x) { m <- mean(x); mean((x - m)^3) / mean((x - m)^2)^1.5 }
+exkurt <- function(x) { m <- mean(x); mean((x - m)^4) / mean((x - m)^2)^2 - 3 }
+jb_stat <- function(x) { length(x) / 6 * (skew(x)^2 + exkurt(x)^2 / 4) }
+
+X <- coredata(stock_returns)
+jb_p      <- pchisq(apply(X, 2, jb_stat), df = 2, lower.tail = FALSE)
+shapiro_p <- apply(X, 2, function(x) shapiro.test(x)$p.value)
+worst_date <- sapply(tickers, function(s) format(index(stock_returns)[which.min(stock_returns[, s])], "%b %Y"))
+best_date  <- sapply(tickers, function(s) format(index(stock_returns)[which.max(stock_returns[, s])], "%b %Y"))
+
+fmt_p <- function(p) ifelse(p < 0.0001, "<0.0001", sprintf("%.4f", p))
+
+a2_norm_show <- data.frame(
+  Stock      = tickers,
+  Skewness   = round(apply(X, 2, skew), 3),
+  Kurtosis   = round(apply(X, 2, exkurt), 3),
+  Worst      = round(apply(X, 2, min) * 100, 2),
+  Worst_date = worst_date,
+  Best       = round(apply(X, 2, max) * 100, 2),
+  Best_date  = best_date,
+  Shapiro_p  = fmt_p(shapiro_p),
+  JB_p       = fmt_p(jb_p),
+  Decision   = ifelse(shapiro_p < 0.05 | jb_p < 0.05, "Rejected", "Not rejected"),
+  row.names  = NULL)
+
+knitr::kable(a2_norm_show,
+  col.names = c("Stock", "Skewness", "Excess kurtosis", "Worst month (%)", "Worst month date",
+                "Best month (%)", "Best month date", "Shapiro-Wilk p", "Jarque-Bera p", "Decision (5%)"),
+  caption = "Table A2b. Normality tests and distribution shape (Jan 2015 - Dec 2024)")
+```
+- Both the Shapiro-Wilk and Jarque-Bera tests reject normality at the 5% level for AXP, CRM, NFLX and XOM. 
+- These stocks all have an excess kurtosis above 2, which means that they have fat tails, so extreme months happen more often than in a normal distribution
+- The other six stocks are not rejected. NFLX has the highest kurtosis (2.827) and the most extreme months (−49.18% in April 2022 and +40.81% in January 2018)
+
+````{r A2-bootstrap}
+set.seed(1)
+boot_ci <- t(sapply(c("AXP", "CRM", "NFLX", "XOM"), function(s) {
+  x <- as.numeric(stock_returns[, s])
+  m <- replicate(5000, mean(sample(x, replace = TRUE)))
+  quantile(m, c(0.025, 0.975)) * 100
+}))
+boot_tab <- data.frame(Stock = rownames(boot_ci),
+                       t_lower = round(lower[rownames(boot_ci)] * 100, 3),
+                       t_upper = round(upper[rownames(boot_ci)] * 100, 3),
+                       boot_lower = round(boot_ci[, 1], 3),
+                       boot_upper = round(boot_ci[, 2], 3),
+                       row.names = NULL)
+knitr::kable(boot_tab,
+  col.names = c("Stock", "t-interval lower (%)", "t-interval upper (%)",
+                "Bootstrap lower (%)", "Bootstrap upper (%)"),
+  caption = "Table A2c. t-interval vs bootstrap 95% CI for the four non-normal stocks")
+````
+- The bootstrap resamples the 120 monthly returns many times and does not need the normal assumption
+- The two methods give almost the same intervals, and the difference is less than 0.1 percentage points for every limit. 
+- The conclusions are the same: the intervals of AXP, CRM and NFLX are above zero, and the interval of XOM includes zero so the t-interval is reliable, even though the returns of these four stocks have fat tails
+
+```{r A2_plot, fig.width=9, fig.height=4.5}
+long_returns <- as.data.frame(stock_returns) %>%
+  pivot_longer(everything(), names_to = "Stock", values_to = "Return")
+
+ggplot(long_returns, aes(sample = Return)) +
+  stat_qq(size = 0.8) +
+  stat_qq_line(colour = "red") +
+  facet_wrap(~ Stock, scales = "free", ncol = 5) +
+  labs(title = "Figure A2. Normal Q-Q plots of monthly returns",
+       x = "Theoretical quantiles", y = "Sample quantiles")
+```
+- For AAPL, DUK, MA, NEU, NKE and BBY, the points are close to the line, so these returns are close to normal
+- For AXP, CRM, NFLX and XOM, the points at the ends move away from the line, which shows fat tails
+- CRM and XOM have points far above the line on the right side, which means that they have some very strong positive months
+- NFLX and AXP have extreme values on both sides. In all four cases the middle of the distribution follows the line, so the problem comes from a small number of extreme months
+
+## A2 Discussion
+Table A2a gives the mean, standard deviation and 95% confidence interval (CI) for each stock’s expected monthly return (January 2015 to December 2024). A 95% CI means that about 95% of such intervals, from repeated samples, would contain the true expected return; it does not mean that 95% of monthly returns fall inside it. It assumes independent returns with constant mean and variance. The width depends on SE = s/√n (n = 120), so more volatile stocks have wider intervals: NFLX is widest (1.014% to 5.404%) and DUK narrowest (−0.204% to 1.569%). The intervals overlap heavily (AAPL 0.824% to 3.704%, MA 0.602% to 2.966%), so differences in sample means should not be read as clear differences in true expected returns. Five stocks (BBY, DUK, NEU, NKE and XOM) have intervals containing zero, which does not prove that their expected returns are zero. The uncertainty is large: AAPL’s interval spans about 2.9 points per month, roughly 35 points a year.
+
+A CI describes uncertainty about the average, not individual months. NFLX’s lower bound (1.014%) is well above the risk-free return, yet NFLX lost 49.18% in April 2022.
+
+Shapiro-Wilk and Jarque-Bera tests reject normality for AXP, CRM, NFLX and XOM, and their Q-Q plots depart from the line in the tails (Table A2b, Figure A2). These four stocks have excess kurtosis from 2.08 to 2.83 (standard error about 0.45), so the heavy tails are more than noise. Only CRM is clearly skewed (0.728, standard error about 0.22), consistent with its most extreme month being a gain. For the other six stocks, normality is not rejected, but this does not prove it: NKE still has two losses of about −20% and −22%. Extreme returns also cluster in market-wide shocks such as March 2020, when diversification is needed most.
+
+With n = 120, the t-interval for the mean should be reasonably reliable. Bootstrap intervals for the four non-normal stocks differ from the t-intervals by less than 0.1 points (Table A2c), so non-normality matters mainly for tail risk, not for inference about the mean. Mean-variance optimisation ignores tail risk and treats noisy sample means as true values. Maximising the Sharpe ratio is therefore more exposed to this error than minimising variance (A3), because covariances are estimated more precisely than expected returns. For a retired investor, a portfolio may look good on average yet still suffer severe losses in single months
+
+## A3 - Minimum-Variance Portfolio for a Conservative Investor
+John wants to protect his savings. This preference is translated into a **minimum-variance portfolio with a 30% cap**:
+
+$$\min_{w}\; w^\top \Sigma\, w \quad \text{subject to} \quad \sum_{i=1}^{10} w_i = 1,\;\; 0 \le w_i \le 0.30$$
+
+- $w$ = portfolio weights, $\Sigma$ = covariance matrix of the 10 stocks (estimation sample)
+- Fully invested (weights add to 100%)
+- No short selling (each weight is at least 0)
+- A maximum of 30% in any one stock, to limit concentration
+  
+```{r A3-setup}
+library(quadprog)
+R     <- as.matrix(coredata(stock_returns))
+mu    <- colMeans(R)
+Sigma <- cov(R)
+k     <- ncol(R)
+cap   <- 0.30
+
+# Minimum variance with cap
+Amat <- cbind(rep(1, k), diag(k), -diag(k))
+bvec <- c(1, rep(0, k), rep(-cap, k))
+sol  <- solve.QP(Dmat = 2 * Sigma, dvec = rep(0, k), Amat = Amat, bvec = bvec, meq = 1)
+w_john <- pmax(sol$solution, 0)
+w_john <- w_john / sum(w_john)
+names(w_john) <- tickers
+
+# Same problem without the cap (for comparison)
+Amat2 <- cbind(rep(1, k), diag(k))
+bvec2 <- c(1, rep(0, k))
+sol2  <- solve.QP(Dmat = 2 * Sigma, dvec = rep(0, k), Amat = Amat2, bvec = bvec2, meq = 1)
+w_nocap <- pmax(sol2$solution, 0)
+w_nocap <- w_nocap / sum(w_nocap)
+names(w_nocap) <- tickers
+
+# Checks
+cat("Sum:", sum(w_john), " Min:", min(w_john), " Max:", max(w_john), "\n")
+```
+
+```{r A3_stats}
+port_ret <- as.numeric(R %*% w_john)
+ex_port  <- port_ret - as.numeric(rf)
+john_vol <- sqrt(as.numeric(t(w_john) %*% Sigma %*% w_john))
+
+john_stats <- data.frame(
+  Measure = c("Expected return (% per month)", "Volatility (% per month)",
+              "Sharpe ratio (monthly)", "Worst month (%)",
+              "Effective number of stocks"),
+  Value = c(round(sum(w_john * mu) * 100, 2),
+            round(john_vol * 100, 2),
+            round(mean(ex_port) / sd(ex_port), 3),
+            round(min(port_ret) * 100, 2),
+            round(1 / sum(w_john^2), 2))
+)
+knitr::kable(john_stats, caption = "Table A3a. John's minimum-variance portfolio statistics (Jan 2015 - Dec 2024)")
+
+cat("Equal-weight expected return (% per month):", round(mean(mu) * 100, 2), "\n")
+
+```
+-The portfolio has a volatility of 3.70% per month, which is lower than the volatility of every single stock (the lowest is DUK with 4.90%)
+- Its worst month is −9.74%, which is much smaller than the worst months of the single stocks
+- The expected return is 0.990% per month, which is lower than the 1.47% of the equal-weight portfolio, so John gives up some return to reduce risk
+- The Sharpe ratio is 0.229, which is higher than seven of the ten stocks but lower than AAPL, NFLX and MA
+- The effective number of stocks is 4.81, so the portfolio behaves like an equal-weight portfolio of about five stocks, and it is not spread equally across all ten.
+
+```{r A3-weights}
+mrc <- as.numeric(Sigma %*% w_john)                     
+risk_share <- w_john * mrc / john_vol^2
+
+w_df <- data.frame(Stock = tickers,
+                   Weight = round(w_john * 100, 1),
+                   Risk_share = round(risk_share * 100, 1),
+                   MRC = round(mrc * 10000, 1),         
+                   row.names = NULL)
+
+knitr::kable(w_df,
+             col.names = c("Stock", "Weight (%)", "Share of portfolio risk (%)",
+                           "Marginal risk contribution (%²)"),
+             caption = "Table A3b. John's portfolio weights, shares of portfolio risk and marginal risk contribution")
+```
+- DUK and NEU have the highest weights (30% each) because they have the lowest volatilities and low correlations with the other stocks
+- DUK contributes only 22.1% of the risk, so it makes the portfolio safer. BBY has a weight of 0% because adding it would increase the risk
+- Most of the other stocks have the same marginal risk contribution (16.1), so moving money between them cannot reduce the risk further
+- The portfolio is concentrated in about five stocks (effective number 4.81)
+
+```{r A3-bench}
+w_eq      <- rep(1 / k, k)
+eq_vol    <- sqrt(as.numeric(t(w_eq) %*% Sigma %*% w_eq))
+nocap_vol <- sqrt(as.numeric(t(w_nocap) %*% Sigma %*% w_nocap))
+
+bench <- data.frame(
+  Portfolio = c("John (min variance, 30% cap)", "John without cap", "Equal-weight",
+                "DUK only (lowest-vol stock)", "NFLX only"),
+  Vol_pct   = round(c(john_vol, nocap_vol, eq_vol, min(volatility), max(volatility)) * 100, 2)
+)
+
+
+knitr::kable(bench, col.names = c("Portfolio", "Volatility (% per month)"),
+             caption = "Table A3c. Monthly volatility: John vs benchmarks")
+```
+- John’s portfolio has a volatility of 3.70%, which is about 24% lower than the equal-weight portfolio 4.89% and the lowest-volatility stock DUK 4.90%, and about 70% lower than NFLX (12.14%)
+- Without the 30% cap the volatility would be 3.57%, so the cap increases the risk only slightly.
+
+```{r A3-cap-table}
+cap_df <- data.frame(Stock = tickers,
+                     With_cap = round(w_john * 100, 1),
+                     No_cap   = round(w_nocap * 100, 1),
+                     row.names = NULL)
+knitr::kable(cap_df, col.names = c("Stock", "30% cap (%)", "No cap (%)"), caption = "Table A3d. John's weights with and without the 30% cap")
+```
+- Without the cap, DUK has a weight of 46.2%, and DUK and NEU together hold 74.2% of the portfolio 
+- With the cap, DUK is reduced to 30%, and the extra money goes mainly to NKE, XOM, MA and AAPL
+- The cap spreads the portfolio over more stocks, and it increases the volatility only slightly (3.57% to 3.70%, Table A3c).
+
+```{r A3-corr}
+knitr::kable(round(cor(R), 2), caption = "Table A3e. Correlation matrix of monthly returns (Jan 2015 - Dec 2024)")
+```
+```{r A3-plot}
+ggplot(w_df, aes(x = reorder(Stock, -Weight), y = Weight)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = Weight), vjust = -0.4) +
+  labs(title = "Figure A3. John's portfolio weights",x = "Stock", y = "Weight (%)")
+```
+- DUK and NEU each have the maximum weight of 30%, so together they hold 60% of the portfolio
+- XOM has 11.2%, and the other six stocks have between 2.6% and 6.6%. BBY has a weight of 0%, so it is not in the portfolio.
+
+## A3 Discussion
+John's priority is capital preservation, so his objective is to minimise portfolio variance w′Σw, subject to the weights summing to 1 and each weight lying between 0 and 0.30, using the estimation-sample covariance matrix. Minimising variance targets the size of monthly fluctuations, which is what John wants to avoid. Short selling is excluded because short positions can lose more than the amount invested. The 30% cap limits concentration because covariances are estimated with error; its level is a judgement. Without the cap, DUK would receive 46.2% and NEU 28.0%, with volatility of 3.57% instead of 3.70%, so the cap costs only about 0.13 percentage points (Tables A3c and A3d).
+
+DUK and NEU receive 30% each, XOM 11.2%, six other stocks 2.6% to 6.6%, and BBY zero (Table A3b, Figure A3). Variances show which stocks are risky on their own and covariances show which combinations diversify: DUK and NEU have the two lowest volatilities (4.90% and 5.66%) and low correlations with the other stocks (Table A3e). The objective ignores expected returns, so NEU is heavily weighted despite having the lowest return in A1, while volatile stocks such as NFLX and CRM still receive small weights because they are almost uncorrelated with DUK and NEU. The marginal risk contributions confirm the solution: the seven interior stocks share the same value (16.1), so moving weight among them cannot reduce variance; DUK (10.1) and NEU (14.1) are lower, so the optimiser would add more but the cap stops it; BBY (17.8) is higher, so it receives zero.
+
+The portfolio has an expected return of 0.99% per month, volatility of 3.70% and a Sharpe ratio of 0.229 (Table A3a). Its volatility is about 24% below both the equal-weight portfolio (4.89%) and DUK (4.90%), at a cost of about 0.48 percentage points of monthly return relative to equal weighting. Its worst month was −9.74%, an in-sample figure that is probably optimistic. With 4.81 effective stocks, 60% of the money sits in two names.
+
+The portfolio is conservative relative to these 10 stocks, but calling an equity-only portfolio "low risk" would be misleading: 3.70% monthly volatility is about 12.8% a year, and a −9.74% month on $1.5 million is a loss of about $146,000. Variance also treats gains and losses alike: NEU receives the maximum weight for its low volatility, yet its drawdown (38.2%) was worse than MA's (26.2%, Table A1d). Heavy tails in AXP, CRM, NFLX and XOM (A2) mean variance may understate extreme losses, and correlations tend to rise in crises such as 2020, exactly when diversification is needed. A retired investor would normally also hold bonds or cash.
+
